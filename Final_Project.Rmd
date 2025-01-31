@@ -1,0 +1,1039 @@
+---
+title: "PJ"
+author: "Yijun Luo"
+date: "2024-11-23"
+output: html_document
+---
+
+## Effective Data Wrangling
+
+Import CEL data
+
+```{r}
+# Load libraries
+library(affy)
+library(limma)
+
+# Read RAW Data
+dir.path <- "E-GEOD-46602"
+fns <- sort(list.celfiles(path=dir.path, full.names=TRUE))
+data <- ReadAffy(filenames=fns, phenoData=NULL)
+summary(data)
+
+# Modify sample names
+current_names <- sampleNames(data)
+modified_names <- sub("_.*", "", current_names)
+sampleNames(data) <- modified_names
+
+sampleNames(data)
+
+```
+
+Import annotation
+
+```{r}
+# annotation
+annotations <- read.table("E-GEOD-46602.sdrf.txt", header = TRUE, sep = "\t", row.names = 1)
+rownames(annotations) <- gsub(" 1$", "", rownames(annotations))
+ann <- annotations[, c(
+  "Characteristics..age.",
+  "Characteristics..organism.part."
+)]
+
+colnames(ann) <- c(
+  "Age",
+  "Organism_Part"
+)
+ann
+```
+
+Impute Missing Value
+
+```{r}
+colSums(is.na(ann))
+
+# Impute missing values in Age columns with the median
+num_cols <- c("Age")
+for (col in num_cols) {
+  ann[[col]][is.na(ann[[col]])] <- median(ann[[col]], na.rm = TRUE)
+}
+
+# Add FactorValue..margin_status. to ann
+ann$Margin_Status <- annotations[rownames(ann), "FactorValue..margin_status."]
+
+# Replace NA values with "Normal"
+ann$Margin_Status[is.na(ann$Margin_Status)] <- "Normal"
+
+ann$bcr <- annotations[rownames(ann), "Characteristics..bcr."]
+ann$bcr[is.na(ann$bcr)] <- "Normal"
+
+ann
+```
+
+Categorize class
+
+```{r}
+# Categorize samples
+ann$Age_Group <- ifelse(ann$Age < 65, "Age<65", "Age≥65")
+ann$Disease_Status <- ifelse(
+  ann$Organism_Part == "benign prostate glands", 
+  "Normal", 
+  "Disease"
+)
+
+head(ann)
+
+table(ann$Age_Group)
+table(ann$Disease_Status)
+table(ann$Margin_Status)
+table(ann$bcr)
+```
+
+## Transformation and Normalization
+
+RMA normalization
+
+```{r}
+# View a summary of the normalized data
+dim(exprs(data))
+```
+
+```{r}
+normalized_data <- rma(data)
+
+dim(normalized_data)
+```
+
+```{r}
+summary(exprs(normalized_data))
+```
+
+```{r}
+dim(exprs(normalized_data))
+```
+
+```{r}
+# Function to calculate M and A values
+calculate_MA <- function(expr_matrix) {
+  # Log2 transform the raw data
+  expr_matrix <- log2(expr_matrix + 1)
+  # Calculate M (log ratio) and A (average intensity)
+  A <- rowMeans(expr_matrix)
+  M <- expr_matrix[, 1] - rowMeans(expr_matrix[, -1])
+  data.frame(A = A, M = M)
+}
+
+# Calculate M and A values for raw data
+ma_raw <- calculate_MA(exprs(data))
+```
+
+Comparison between no normalization and rma normalization
+
+```{r}
+# Function to calculate M and A values
+calculate_MA <- function(expr_matrix) {
+  # Log2 transform if not already done
+  if (any(expr_matrix > 100)) {
+    expr_matrix <- log2(expr_matrix + 1)
+  }
+  # Calculate M (log ratio) and A (average intensity)
+  A <- rowMeans(expr_matrix)
+  M <- expr_matrix[, 1] - rowMeans(expr_matrix[, -1])
+  data.frame(A = A, M = M)
+}
+# Generate MvA data for RMA normalized data
+ma_rma <- calculate_MA(exprs(normalized_data))
+
+
+library(ggplot2)
+par(mfrow = c(1, 2))
+ggplot(ma_raw, aes(x = A, y = M)) +
+  geom_point(alpha = 0.5, color = "black") +
+  geom_hline(yintercept = 0, color = "red") +
+  labs(title = "MvA Plot - Before Normalization", x = "A", y = "M") +
+  theme_minimal()
+
+# Plot MvA for RMA normalized data
+ggplot(ma_rma, aes(x = A, y = M)) +
+  geom_point(alpha = 0.5, color = "black") +
+  geom_hline(yintercept = 0, color = "red") +
+  labs(title = "MvA Plot - RMA Normalization", x = "A", y = "M") +
+  theme_minimal()
+
+```
+
+## Data noise filtering
+```{r}
+# Calculate the mean and standard deviation for each gene
+gene_means <- rowMeans(exprs(normalized_data))
+gene_sds <- apply(exprs(normalized_data), 1, sd)
+
+# Calculate CV for each gene
+gene_cvs <- gene_sds / gene_means
+
+# Plot histogram of CVs
+hist(gene_cvs, breaks = 50, col = "lightblue",
+     main = "Distribution of Coefficient of Variation (CV)",
+     xlab = "Coefficient of Variation")
+
+```
+
+```{r}
+nrow(exprs(normalized_data))
+
+cv_threshold <- quantile(gene_cvs, 0.75)
+
+# Filter genes based on CV
+filtered_data <- exprs(normalized_data)[gene_cvs > cv_threshold, ]
+
+# Verify the dimensions after filtering
+cat("Number of genes retained after CV filtering:", nrow(filtered_data), "\n")
+
+```
+
+```{r}
+# Plot CVs of retained genes
+filtered_cvs <- gene_cvs[gene_cvs > cv_threshold]
+
+hist(filtered_cvs, breaks = 50, col = "lightgreen",
+     main = "CV Distribution After Filtering",
+     xlab = "Coefficient of Variation")
+
+
+```
+
+Retained the top 25% of transcripts based on their variance
+
+
+
+## Exploratory analysis
+
+
+```{r}
+# Perform PCA on the filtered data
+pca_res <- prcomp(t(filtered_data), scale. = TRUE)
+
+# Plot PCA results
+library(ggplot2)
+pca_data <- as.data.frame(pca_res$x)
+pca_data$Group <- ann[rownames(pca_res$x), ]$Disease_Status  
+
+# Add labels to points
+ggplot(pca_data, aes(x = PC1, y = PC2, color = Group, label = rownames(pca_data))) +
+  geom_point(size = 2) +
+  geom_text(vjust = -0.5, size = 3) +  # Add labels slightly above points
+  labs(title = "PCA of Filtered Data", x = "Principal Component 1", y = "Principal Component 2") +
+  theme_minimal()
+
+
+```
+```{r}
+pca_data$Age <- ann[rownames(pca_res$x), ]$Age_Group  
+
+# Add labels to points
+ggplot(pca_data, aes(x = PC1, y = PC2, color = Age, label = rownames(pca_data))) +
+  geom_point(size = 2) +
+  geom_text(vjust = -0.5, size = 3) +  # Add labels slightly above points
+  labs(title = "PCA of Filtered Data", x = "Principal Component 1", y = "Principal Component 2") +
+  theme_minimal()
+```
+```{r}
+pca_data$Margin <- annotations[rownames(pca_res$x), ]$FactorValue..margin_status.  
+
+# Add labels to points
+ggplot(pca_data, aes(x = PC1, y = PC2, color = Margin, label = rownames(pca_data))) +
+  geom_point(size = 2) +
+  geom_text(vjust = -0.5, size = 3) +  # Add labels slightly above points
+  labs(title = "PCA of Filtered Data", x = "Principal Component 1", y = "Principal Component 2") +
+  theme_minimal()
+```
+
+```{r}
+library(pheatmap)
+
+# Calculate correlation matrix
+cor_matrix <- cor(filtered_data, use = "pairwise.complete.obs", method = "pearson")
+
+# Subset and reorder ann to match the column names of cor_matrix
+ann_aligned <- ann[colnames(cor_matrix), , drop = FALSE]
+
+annotation_col <- data.frame(Group = ann_aligned$Disease_Status)
+rownames(annotation_col) <- rownames(ann_aligned)
+ordered_samples <- order(annotation_col$Group)
+
+# Reorder cor_matrix and annotation_col
+cor_matrix <- cor_matrix[ordered_samples, ordered_samples]
+annotation_col <- annotation_col[ordered_samples, , drop = FALSE]
+
+pheatmap(cor_matrix,
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         main = "Sample Correlation Heatmap (Grouped by Disease Status)",
+         annotation_col = annotation_col,
+         cluster_cols = FALSE, 
+         cluster_rows = FALSE,
+         fontsize_row = 6,
+         fontsize_col = 6) 
+```
+
+
+## Outlier assessment and removal
+```{r}
+# Calculate average correlation for each sample
+avg_cor <- apply(cor_matrix, 1, mean)
+# Plot average correlation
+plot(c(1, length(avg_cor)), range(avg_cor), 
+     type = "n", 
+     xlab = "Sample", 
+     ylab = "Average Correlation (r)", 
+     main = "Average Correlation of Samples", 
+     axes = FALSE)
+
+# Add points to the plot
+points(avg_cor, bg = "red", col = 1, pch = 21, cex = 1.25)
+
+# Add X and Y axes
+axis(1, at = 1:length(avg_cor), labels = colnames(cor_matrix), las = 2, cex.axis = 0.6)
+axis(2)
+
+# Add vertical lines for clarity
+abline(v = seq(0.5, length(avg_cor) + 0.5, 1), col = "grey")
+
+```
+
+```{r}
+# Calculate Mean, Standard Deviation, and CV for each sample
+filtered_mean <- apply(log2(filtered_data), 2, mean)  # Mean expression per sample
+filtered_sd <- sqrt(apply(log2(filtered_data), 2, var))  # Standard deviation per sample
+filtered_cv <- filtered_sd / filtered_mean  # Coefficient of Variation (CV)
+
+# Plot CV vs. Mean
+plot(filtered_mean, filtered_cv, 
+     main = "CV vs. Mean Plot for Filtered Data", 
+     xlab = "Mean Expression (log2)", 
+     ylab = "Coefficient of Variation (CV)", 
+     col = 'blue', cex = 1.5, type = "n")  # Create an empty plot
+
+# Add points to the plot
+points(filtered_mean, filtered_cv, bg = "lightblue", col = 1, pch = 21)
+
+# Label points with sample IDs
+text(filtered_mean, filtered_cv, labels = colnames(filtered_data), cex = 0.7)
+
+```
+## Clustering 
+```{r}
+# Define outliers
+outliers <- c("GSM1133140", "GSM1133169")
+
+# Remove outliers from the dataset
+dat <- filtered_data[, !colnames(filtered_data) %in% outliers]
+
+# Verify dimensions
+dim(dat)
+
+```
+```{r}
+# Calculate distance matrix
+distance_matrix <- dist(t(dat), method = "euclidean")  # Transpose for sample-wise distance
+
+# Perform hierarchical clustering
+hc <- hclust(distance_matrix, method = "complete")
+
+
+library(dendextend)
+
+ann <- ann[match(colnames(dat), rownames(ann)), ]
+# Assign colors based on disease status and age group
+disease_colors <- ifelse(ann$Disease_Status == "Disease", "red", "blue")  # Disease: red, Normal: blue
+age_colors <- ifelse(ann$Age_Group == "Age<65", "green", "purple")       # Age<65: green, Age≥65: purple
+names(disease_colors) <- hc$labels
+disease_colors
+```
+
+HCA
+```{r}
+library(dendextend)
+
+dend_disease <- as.dendrogram(hc)
+
+# Reorder disease_colors based on the labels in the dendrogram
+disease_colors_ordered <- disease_colors[order.dendrogram(dend_disease)]
+
+dend_disease <- dend_disease %>%
+  set("labels_colors", value = disease_colors_ordered) %>%
+  set("labels_cex", 0.6)  # Reduce label font size
+
+# Plot the dendrogram
+plot(dend_disease, main = "Clustering by Disease Status", xlab = "Samples", sub = "")
+
+# Add a legend
+legend("topright", legend = c("Disease", "Normal"), fill = c("red", "blue"), 
+       title = "Disease Status", bty = "n", cex = 0.8)
+
+
+```
+```{r}
+margin_colors <- ifelse(
+  annotations$FactorValue..margin_status. == "Positive", "red", 
+  ifelse(annotations$FactorValue..margin_status. == "Negative", "orange", NA)
+)
+
+margin_colors <- margin_colors[rownames(annotations) %in% colnames(dat)]
+names(margin_colors) <- rownames(annotations)[rownames(annotations) %in% colnames(dat)]
+
+dend_margin <- as.dendrogram(hc)
+labels_order <- labels(dend_margin) 
+# Filter and reorder margin_colors to match dendrogram labels
+margin_colors_aligned <- margin_colors[labels_order]
+names(margin_colors_aligned) <- labels_order 
+dend_margin <- dend_margin %>%
+  set("labels_colors", value = margin_colors_aligned) %>%
+  set("labels_cex", 0.6)  # Adjust label font size
+
+# Plot the dendrogram
+plot(dend_margin, main = "Clustering by Margin Status", xlab = "Samples", sub = "")
+
+# Add a legend
+legend("topright", legend = c("Positive", "Negative","Normal"), fill = c("red", "orange","black"), 
+       title = "Margin Status", bty = "n", cex = 0.8)
+```
+```{r}
+bcr_colors <- ifelse(
+  ann$bcr == "YES", "red", 
+  ifelse(ann$bcr == "NO", "orange", NA)
+)
+
+bcr_colors <- bcr_colors[rownames(ann) %in% colnames(dat)]
+names(bcr_colors) <- rownames(ann)[rownames(ann) %in% colnames(dat)]
+
+dend_bcr <- as.dendrogram(hc)
+labels_order <- labels(dend_bcr) 
+# Filter and reorder margin_colors to match dendrogram labels
+bcr_colors_aligned <- bcr_colors[labels_order]
+names(bcr_colors_aligned) <- labels_order 
+dend_bcr <- dend_bcr %>%
+  set("labels_colors", value = bcr_colors_aligned) %>%
+  set("labels_cex", 0.6)  # Adjust label font size
+
+# Plot the dendrogram
+plot(dend_bcr, main = "Clustering by Biochemical Recurrence", xlab = "Samples", sub = "")
+
+# Add a legend
+legend("topright", legend = c("YES", "NO","Normal"), fill = c("red", "orange","black"), 
+       title = "Biochemical Recurrence", bty = "n", cex = 0.8)
+```
+
+
+K-Means
+```{r}
+pca.res <- prcomp(t(dat), scale. = TRUE)
+# Use the first 2 principal components for clustering
+pca.data <- pca.res$x[, 1:2]  # Select PC1 and PC2
+pca.data <- as.data.frame(pca.data)
+
+# Perform k-means clustering
+set.seed(123)  # Ensure reproducibility
+kmeans_res <- kmeans(pca.data, centers = 3, iter.max = 10)  
+
+# Add cluster assignments to PCA data
+pca.data$Cluster <- as.factor(kmeans_res$cluster)
+# Prepare cluster centers
+cluster_centers <- as.data.frame(kmeans_res$centers)
+colnames(cluster_centers) <- c("PC1", "PC2") 
+
+library(ggrepel)
+
+pca.data$Disease_Status  <- ann[rownames(pca.res$x), ]$Disease_Status
+pca.data$Age_Group <- ann[rownames(pca.res$x), ]$Age_Group
+
+library(ggplot2)
+
+# Plot k-means clusters with Disease Status and Age Group
+ggplot(pca.data, aes(x = PC1, y = PC2, color = Cluster, shape = Age_Group, label = Disease_Status)) +
+  geom_point(size = 3) +  # Plot data points with shapes for Age Groups
+  geom_point(data = cluster_centers, aes(x = PC1, y = PC2), 
+             inherit.aes = FALSE, color = "black", shape = 8, size = 4) +  # Add cluster centers
+  geom_text_repel(size = 3, max.overlaps = 15) +  # Add Disease Status labels
+  labs(title = "K-Means Clustering - age", 
+       x = "Principal Component 1", 
+       y = "Principal Component 2", 
+       color = "Cluster", 
+       shape = "Age Group") +
+  theme_minimal()
+```
+
+```{r}
+pca.data$Margin_Status <- ifelse(
+  pca.data$Disease_Status == "Disease",  # Only include for Disease samples
+  annotations$FactorValue..margin_status.[match(rownames(pca.data), rownames(annotations))],
+  NA
+)
+
+library(ggplot2)
+library(ggrepel)
+
+# Plot k-means clusters with labels only for samples with Margin_Status
+ggplot(pca.data, aes(x = PC1, y = PC2, color = Cluster)) +
+  geom_point(size = 2, aes(shape = Disease_Status)) +  # Shape differentiates Disease/Normal
+  geom_point(data = cluster_centers, aes(x = PC1, y = PC2), 
+             inherit.aes = FALSE, color = "black", shape = 8, size = 4) +  # Add cluster centers
+  geom_text_repel(aes(label = ifelse(!is.na(Margin_Status), Margin_Status, "")), 
+                  size = 3, max.overlaps = 15, na.rm = TRUE) +  # Label only if Margin_Status is not NA
+  labs(title = "K-Means Clustering (k = 3) with Margin Status Labels", 
+       x = "Principal Component 1", 
+       y = "Principal Component 2", 
+       color = "Cluster", 
+       shape = "Disease Status") +
+  theme_minimal()
+
+```
+
+```{r}
+# Add BRC (Biochemical Recurrence) Status to PCA Data
+pca.data$bcr <- ifelse(
+  pca.data$Disease_Status == "Disease",  # Include only for Disease samples
+  annotations$Characteristics..bcr.[match(rownames(pca.data), rownames(annotations))],
+  NA
+)
+
+library(ggplot2)
+library(ggrepel)
+
+# Plot k-means clusters with BRC labels
+ggplot(pca.data, aes(x = PC1, y = PC2, color = Cluster)) +
+  geom_point(size = 2, aes(shape = Disease_Status)) +  # Shape differentiates Disease/Normal
+  geom_point(data = cluster_centers, aes(x = PC1, y = PC2), 
+             inherit.aes = FALSE, color = "black", shape = 8, size = 4) +  # Add cluster centers
+  geom_text_repel(aes(label = ifelse(!is.na(bcr), bcr, "")), 
+                  size = 3, max.overlaps = 15, na.rm = TRUE) +  # Label only if BRC is not NA
+  labs(title = "K-Means Clustering (k = 3) with BCR Labels", 
+       x = "Principal Component 1", 
+       y = "Principal Component 2", 
+       color = "Cluster", 
+       shape = "Disease Status") +
+  theme_minimal()
+
+```
+
+## Normality and variance assessment and differential test selection defended
+```{r}
+# Load necessary libraries
+library(stats)
+
+# Perform Shapiro-Wilk test for normality
+set.seed(1129)
+genes_to_test <- sample(rownames(dat), 100)  # Test 100 random genes
+shapiro_results <- apply(dat[genes_to_test, ], 1, function(x) {
+  shapiro.test(x)$p.value
+})
+
+mean(shapiro_results > 0.05)
+
+normality_pvalues <- apply(dat, 1, function(x) {
+  if (length(unique(x)) > 3) { # Shapiro-Wilk requires at least 4 unique values
+    shapiro.test(x)$p.value
+  } else {
+    NA
+  }
+})
+cat("Number of genes with normal distribution:", sum(normality_pvalues > 0.05, na.rm = TRUE), "\n")
+```
+
+
+
+Variance Analysis
+```{r}
+library(car)
+group_labels <- factor(ann[colnames(dat), "Disease_Status"], levels = c("Normal", "Disease"))
+
+# Perform Levene's test for each gene
+levene_results <- apply(dat, 1, function(x) {
+  if (length(unique(group_labels)) > 1) {  # Ensure multiple groups exist
+    leveneTest(x ~ group_labels)$`Pr(>F)`[1]  # Extract p-value
+  } else {
+    NA
+  }
+})
+
+# Summary of results
+cat("Number of genes with equal variance (p >= 0.05):", sum(levene_results >= 0.05, na.rm = TRUE), "\n")
+cat("Number of genes with unequal variance (p < 0.05):", sum(levene_results < 0.05, na.rm = TRUE), "\n")
+```
+
+## Differential testing with test selected for use
+
+age
+```{r}
+# Ensure Age_Group is numeric
+age_numeric <- as.numeric(ann$Age)
+spearman_results <- apply(dat, 1, function(x) {
+  cor(x, age_numeric, method = "spearman")
+})
+
+# Perform Spearman correlation test for each gene
+spearman_pvalues <- apply(dat, 1, function(x) {
+  cor.test(x, age_numeric, method = "spearman", exact = FALSE)$p.value  # Use asymptotic approximation
+})
+
+# Adjust p-values using FDR
+spearman_pvalues_adjusted <- p.adjust(spearman_pvalues, method = "fdr")
+
+# Extract significant genes (FDR < 0.05)
+significant_age_genes <- names(spearman_pvalues_adjusted[spearman_pvalues_adjusted < 0.05])
+
+# Output the number and names of significant genes
+cat("Number of significant genes (Spearman, Age):", length(significant_age_genes), "\n")
+```
+
+
+
+Wilcoxon Rank-Sum Test
+
+```{r}
+# Perform Wilcoxon rank-sum test with continuity correction (asymptotic approximation)
+disease_vs_normal_pvalues <- apply(dat, 1, function(x) {
+  wilcox.test(x ~ group_labels, exact = FALSE)$p.value  # Use approximation for tied data
+})
+
+
+significant_genes <- names(disease_vs_normal_pvalues[disease_vs_normal_pvalues < 0.05])
+cat("Number of significant genes (Disease vs. Normal):", length(significant_genes), "\n")
+
+```
+```{r}
+# Define group labels for Margin Status and BCR
+margin_status <- factor(ann[colnames(dat), "Margin_Status"])
+
+# Perform Kruskal-Wallis Test for Margin Status
+kw_pvalues_margin <- apply(dat, 1, function(x) {
+  kruskal.test(x ~ margin_status)$p.value
+})
+
+# Count significant genes
+significant_genes_margin <- sum(kw_pvalues_margin < 0.05)
+cat("Number of significant genes (Kruskal-Wallis, Margin Status):", significant_genes_margin, "\n")
+
+```
+
+```{r}
+bcr_status <- factor(ann[colnames(dat), "bcr"])
+
+# Perform Kruskal-Wallis Test for BCR
+kw_pvalues_bcr <- apply(dat, 1, function(x) {
+  kruskal.test(x ~ bcr_status)$p.value
+})
+
+# Count significant genes
+significant_genes_bcr <- sum(kw_pvalues_bcr < 0.05)
+cat("Number of significant genes (Kruskal-Wallis, BCR):", significant_genes_bcr, "\n")
+
+```
+
+```{r}
+# Histogram for Disease vs. Normal (Wilcoxon Test)
+hist(disease_vs_normal_pvalues, breaks = 50, col = "lightblue",
+     main = "Wilcoxon Test Histogram of P-Values (Normal vs Disease)",
+     xlab = "P-Values",
+     ylab = "Frequency")
+
+# Histogram for Margin Status (Kruskal-Wallis Test)
+hist(kw_pvalues_margin, breaks = 50, col = "lightcoral",
+     main = "Kruskal-Wallis Test Histogram of P-Values (Margin Status)",
+     xlab = "P-Values",
+     ylab = "Frequency")
+
+# Histogram for BCR (Kruskal-Wallis Test)
+hist(kw_pvalues_bcr, breaks = 50, col = "lightgreen",
+     main = "Kruskal-Wallis Test Histogram of P-Values (BCR)",
+     xlab = "P-Values",
+     ylab = "Frequency")
+
+```
+## Multiple comparison correction
+
+```{r}
+if (!require("multtest")) install.packages("multtest")
+library(multtest)
+
+group_labels <- factor(ann[colnames(dat), "Disease_Status"], levels = c("Normal", "Disease"))
+
+# Perform permutation-based correction using the MinP method
+resP <- mt.minP(dat, group_labels, test = "t", side = "abs")$rawp
+
+# Adjust p-values using multiple methods
+adjusted_pvalues <- mt.rawp2adjp(resP, proc = c("Bonferroni", "Holm", "BH", "BY", "Hochberg"))
+
+# Extract adjusted p-values and sort by raw p-values
+adjusted_pvalues_sorted <- adjusted_pvalues$adjp[order(adjusted_pvalues$index), ]
+```
+
+```{r}
+plot(
+  1:length(resP),
+  sort(resP),  # Raw p-values
+  type = "l",
+  col = "black",
+  lwd = 2,
+  xlab = "Number of Rejected Hypotheses",
+  ylab = "Adjusted p-values",
+  main = "Performance Comparison of MCC Methods"
+)
+lines(
+  1:length(resP),
+  sort(adjusted_pvalues_sorted[, "BH"]),
+  col = "blue",
+  lwd = 2
+)
+lines(
+  1:length(resP),
+  sort(adjusted_pvalues_sorted[, "Bonferroni"]),
+  col = "red",
+  lwd = 2
+)
+lines(
+  1:length(resP),
+  sort(adjusted_pvalues_sorted[, "Holm"]),
+  col = "green",
+  lwd = 2
+)
+lines(
+  1:length(resP),
+  sort(adjusted_pvalues_sorted[, "BY"]),
+  col = "purple",
+  lwd = 2
+)
+lines(
+  1:length(resP),
+  sort(adjusted_pvalues_sorted[, "Hochberg"]),
+  col = "orange",
+  lwd = 2
+)
+
+# Add legend
+legend(
+  "bottomright",
+  legend = c("Raw p-values", "BH", "Bonferroni", "Holm", "BY", "Hochberg"),
+  col = c("black", "blue", "red", "green", "purple", "orange"),
+  lwd = 2
+)
+```
+
+```{r}
+# Extract adjusted p-values for each method
+raw_pvalues <- adjusted_pvalues_sorted[, "rawp"]
+bonferroni_pvalues <- adjusted_pvalues_sorted[, "Bonferroni"]
+holm_pvalues <- adjusted_pvalues_sorted[, "Holm"]
+bh_pvalues <- adjusted_pvalues_sorted[, "BH"]
+by_pvalues <- adjusted_pvalues_sorted[, "BY"]
+hochberg_pvalues <- adjusted_pvalues_sorted[, "Hochberg"]
+
+# Calculate number of significant genes for each method
+significant_counts <- data.frame(
+  Method = c("Raw", "Bonferroni", "Holm", "BH", "BY", "Hochberg"),
+  Significant_Genes = c(
+    sum(raw_pvalues < 0.05),
+    sum(bonferroni_pvalues < 0.05),
+    sum(holm_pvalues < 0.05),
+    sum(bh_pvalues < 0.05),
+    sum(by_pvalues < 0.05),
+    sum(hochberg_pvalues < 0.05)
+  )
+)
+
+# Display the counts
+print(significant_counts)
+
+```
+
+Choose BH
+
+```{r}
+# Histogram of BH-adjusted p-values
+significant_bh_pvalues <- adjusted_pvalues_sorted[, "BH"]
+hist(
+  significant_bh_pvalues,
+  breaks = 50,
+  col = "lightblue",
+  main = "Distribution of Adjusted P-Values (BH)",
+  xlab = "Adjusted P-Value",
+  ylab = "Frequency"
+)
+
+```
+
+```{r}
+# Adjust p-values using BH for Disease vs. Normal
+bh_adjusted_pvalues_disease <- p.adjust(disease_vs_normal_pvalues, method = "BH")
+
+# Select significant genes (FDR < 0.05)
+significant_genes_bh_disease <- names(bh_adjusted_pvalues_disease[bh_adjusted_pvalues_disease < 0.05])
+
+# Calculate threshold
+threshold_bh_disease <- max(bh_adjusted_pvalues_disease[bh_adjusted_pvalues_disease < 0.05])
+
+# Output
+cat("Number of significant genes (BH, Disease vs. Normal):", length(significant_genes_bh_disease), "\n")
+cat("Threshold value (BH, Disease vs. Normal):", threshold_bh_disease, "\n")
+
+```
+```{r}
+# Adjust p-values using BH for Margin Status
+bh_adjusted_pvalues_margin <- p.adjust(kw_pvalues_margin, method = "BH")
+
+# Select significant genes (FDR < 0.05)
+significant_genes_bh_margin <- names(bh_adjusted_pvalues_margin[bh_adjusted_pvalues_margin < 0.05])
+
+# Calculate threshold
+threshold_bh_margin <- max(bh_adjusted_pvalues_margin[bh_adjusted_pvalues_margin < 0.05])
+
+# Output
+cat("Number of significant genes (BH, Margin Status):", length(significant_genes_bh_margin), "\n")
+cat("Threshold value (BH, Margin Status):", threshold_bh_margin, "\n")
+
+```
+
+
+```{r}
+# Adjust p-values using BH for BCR
+bh_adjusted_pvalues_bcr <- p.adjust(kw_pvalues_bcr, method = "BH")
+
+# Select significant genes (FDR < 0.05)
+significant_genes_bh_bcr <- names(bh_adjusted_pvalues_bcr[bh_adjusted_pvalues_bcr < 0.05])
+
+# Calculate threshold
+threshold_bh_bcr <- max(bh_adjusted_pvalues_bcr[bh_adjusted_pvalues_bcr < 0.05])
+
+# Output
+cat("Number of significant genes (BH, BCR):", length(significant_genes_bh_bcr), "\n")
+cat("Threshold value (BH, BCR):", threshold_bh_bcr, "\n")
+
+```
+
+## Confirmatory analysis 
+```{r}
+shared_significant_genes <- Reduce(intersect, list(
+    significant_genes_bh_disease,
+    significant_genes_bh_margin,
+    significant_genes_bh_bcr
+))
+
+subset_data <- dat[shared_significant_genes, ]
+
+# Display the dimensions of the subset data
+cat("Subset data dimensions (Shared Significant Genes):", dim(subset_data), "\n")
+```
+
+```{r}
+pca_res <- prcomp(t(subset_data), scale. = TRUE)
+pca_data <- as.data.frame(pca_res$x)
+pca_data$Group <- ann[colnames(subset_data), "Disease_Status"]
+
+# Visualize PCA
+library(ggplot2)
+ggplot(pca_data, aes(x = PC1, y = PC2, color = Group)) +
+  geom_point(size = 3) +
+  labs(title = "PCA of Significant Genes", x = "Principal Component 1", y = "Principal Component 2") +
+  theme_minimal()
+```
+
+
+```{r}
+pca_summary <- summary(pca_res)
+pca_variance <- pca_summary$importance[2,]
+
+# scree plot
+plot(pca_variance, type = "b", pch = 19, col = "blue",
+     main = "Scree Plot of PCA",
+     xlab = "Principal Component",
+     ylab = "Proportion of Variance Explained")
+
+variance_first_two <- sum(pca_variance[1:2]) * 100
+cat("The first two principal components explain approximately", round(variance_first_two, 2), "% of the variability in the data.\n")
+```
+
+
+```{r}
+# Correlation matrix
+cor_matrix <- cor(subset_data, method = "pearson")
+
+annotation_col.sub <- data.frame(Group = ann[colnames(subset_data), "Disease_Status"])
+rownames(annotation_col.sub) <- colnames(subset_data)  # Ensure matching row names
+
+library(pheatmap)
+pheatmap(
+  cor_matrix,
+  color = colorRampPalette(c("blue", "white", "red"))(100),
+  main = "Sample Correlation Heatmap",
+  annotation_col = annotation_col.sub,
+  fontsize_row = 6,
+  fontsize_col = 6
+)
+
+
+```
+
+
+## Classification Modeling
+
+```{r}
+library(caret)  # For splitting data and running models
+
+# Split data into training and testing sets
+set.seed(123)
+trainIndex <- createDataPartition(ann[colnames(subset_data), "Disease_Status"], p = 0.75, list = FALSE)
+train_data <- subset_data[, trainIndex]
+test_data <- subset_data[, -trainIndex]
+
+# Extract labels
+train_labels <- ann[colnames(train_data), "Disease_Status"]
+test_labels <- ann[colnames(test_data), "Disease_Status"]
+
+margin_labels <- factor(ann[colnames(subset_data), "Margin_Status"])
+bcr_labels <- factor(ann[colnames(subset_data), "bcr"])
+
+train_margin <- margin_labels[trainIndex]
+test_margin <- margin_labels[-trainIndex]
+
+train_bcr <- bcr_labels[trainIndex]
+test_bcr <- bcr_labels[-trainIndex]
+```
+
+SVM
+```{r}
+library(e1071)
+
+# Train SVM model
+svm_model <- svm(t(train_data), as.factor(train_labels), kernel = "linear", scale = TRUE)
+
+# Predict on test data
+svm_predictions <- predict(svm_model, t(test_data))
+
+# Evaluate SVM performance
+svm_conf_matrix <- confusionMatrix(as.factor(svm_predictions), as.factor(test_labels))
+print(svm_conf_matrix)
+
+```
+```{r}
+svm_model_margin <- svm(t(train_data), as.factor(train_margin), kernel = "linear", scale = TRUE)
+svm_predictions_margin <- predict(svm_model_margin, t(test_data))
+svm_conf_matrix_margin <- confusionMatrix(as.factor(svm_predictions_margin), as.factor(test_margin))
+print(svm_conf_matrix_margin)
+
+
+```
+
+```{r}
+# Train SVM for BCR
+svm_model_bcr <- svm(t(train_data), as.factor(train_bcr), kernel = "linear", scale = TRUE)
+svm_predictions_bcr <- predict(svm_model_bcr, t(test_data))
+svm_conf_matrix_bcr <- confusionMatrix(as.factor(svm_predictions_bcr), as.factor(test_bcr))
+print(svm_conf_matrix_bcr)
+```
+
+
+
+
+```{r}
+# Perform PCA on test data
+test_pca <- prcomp(t(test_data), scale. = TRUE)
+pca_test_data <- as.data.frame(test_pca$x[, 1:2])  # Use PC1 and PC2
+pca_test_data$Actual_Class <- test_labels
+pca_test_data$Predicted_Class <- svm_predictions
+
+library(ggplot2)
+
+# PCA scatter plot with predicted classes
+ggplot(pca_test_data, aes(x = PC1, y = PC2, color = Predicted_Class, shape = Actual_Class)) +
+  geom_point(size = 3) +
+  labs(
+    title = "SVM Classification Results (PCA Projection)",
+    x = "Principal Component 1",
+    y = "Principal Component 2"
+  ) +
+  theme_minimal() +
+  scale_color_manual(values = c("red", "blue"), name = "Predicted Class") +
+  scale_shape_manual(values = c(16, 17), name = "Actual Class")
+
+
+```
+
+```{r}
+pca_test_data$Actual_Margin <- test_margin
+pca_test_data$Predicted_Margin <- svm_predictions_margin
+
+ggplot(pca_test_data, aes(x = PC1, y = PC2, color = Predicted_Margin, shape = Actual_Margin)) +
+  geom_point(size = 3) +
+  labs(
+    title = "SVM Classification for Margin Status (PCA Projection)",
+    x = "Principal Component 1",
+    y = "Principal Component 2"
+  ) +
+  theme_minimal() +
+  scale_color_manual(values = c("green", "orange", "purple"), name = "Predicted Margin Status") +
+  scale_shape_manual(values = c(16, 17, 18), name = "Actual Margin Status")
+```
+
+```{r}
+pca_test_data$Actual_BCR <- test_bcr
+pca_test_data$Predicted_BCR <- svm_predictions_bcr
+ggplot(pca_test_data, aes(x = PC1, y = PC2, color = Predicted_BCR, shape = Actual_BCR)) +
+  geom_point(size = 3) +
+  labs(title = "SVM Classification for BCR",
+       x = "Principal Component 1", y = "Principal Component 2") +
+  theme_minimal()
+```
+```{r}
+disease_labels <- factor(ann[colnames(dat), "Disease_Status"], levels = c("Normal", "Disease"))
+# Calculate the mean expression for each gene in Disease and Normal samples
+mean_disease <- rowMeans(dat[, disease_labels == "Disease"])
+mean_normal <- rowMeans(dat[, disease_labels == "Normal"])
+
+log_fold_change <- log2(mean_disease + 1) - log2(mean_normal + 1)
+
+sorted_genes <- sort(log_fold_change, decreasing = TRUE)
+
+# Top 5 genes with highest log fold change (positive)
+top_positive_genes <- head(sorted_genes, 5)
+cat("Top 5 genes with the highest positive log fold change:\n")
+print(top_positive_genes)
+
+# Top 5 genes with lowest log fold change (negative)
+top_negative_genes <- tail(sorted_genes, 5)
+cat("Top 5 genes with the lowest log fold change:\n")
+print(top_negative_genes)
+
+```
+
+
+```{r}
+
+library(hgu133plus2.db)
+
+# Define probe IDs
+probe_ids <- c("242138_at", "232572_at", "1563392_at", "205422_s_at", "232575_at")
+
+# Map probe IDs to gene symbols
+gene_symbols <- mapIds(hgu133plus2.db, keys = probe_ids, column = "SYMBOL", keytype = "PROBEID")
+print(gene_symbols)
+
+# Map probe IDs to Entrez IDs
+entrez_ids <- mapIds(hgu133plus2.db, keys = probe_ids, column = "ENTREZID", keytype = "PROBEID")
+print(entrez_ids)
+
+```
+
+```{r}
+library(hgu133plus2.db)
+
+# Define probe IDs
+probe_ids <- c("205765_at", "202504_at", "226755_at", "216158_at", "1552511_a_at")
+
+# Map probe IDs to gene symbols
+gene_symbols <- mapIds(hgu133plus2.db, keys = probe_ids, column = "SYMBOL", keytype = "PROBEID")
+print(gene_symbols)
+
+# Map probe IDs to Entrez IDs
+entrez_ids <- mapIds(hgu133plus2.db, keys = probe_ids, column = "ENTREZID", keytype = "PROBEID")
+print(entrez_ids)
+```
+
